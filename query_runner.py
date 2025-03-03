@@ -7,6 +7,14 @@ import smtplib
 from email.message import EmailMessage
 import os
 
+# Add constant for aggregator order at the top level
+AGGREGATOR_ORDER = [
+    'Karix Mobile Private Limited',
+    'Valuefirst Digital Media Private Limited',
+    'ICS MOBILE PVT LTD',
+    'TANLA PLATFORMS LTD'
+]
+
 def get_clickhouse_client():
     insight_host = '10.10.9.31'
     username = 'dashboard_user'
@@ -116,6 +124,7 @@ def update_traffic_df_with_type(df, mapping):
     
     return df
 
+
 def create_traffic_summary_pivot(dfs):
     """Create overall traffic summary pivot table"""
     combined_df = pd.concat([
@@ -145,33 +154,106 @@ def create_traffic_summary_pivot(dfs):
         if agg in pivot.index.get_level_values('vcORGName'):
             # Add aggregator total first
             agg_total = pivot.loc[agg].sum()
-            ordered_data.append((agg, agg_total))
+            ordered_data.append((agg, 'Total', agg_total))
             
             # Add individual rows for this aggregator
             for idx in pivot.loc[agg].index:
                 type_data = pivot.loc[(agg, idx)]
-                ordered_data.append((f"  {idx}", type_data))
+                ordered_data.append((agg, idx, type_data))
                 # Add to type totals
                 type_totals[idx] += type_data.sum()
     
     # Add type totals
-    ordered_data.append(('Total CPL', pd.Series([type_totals['CPL']] * len(pivot.columns), index=pivot.columns)))
-    ordered_data.append(('Total Enterprise', pd.Series([type_totals['Enterprise']] * len(pivot.columns), index=pivot.columns)))
-    ordered_data.append(('Total OD', pd.Series([type_totals['OD']] * len(pivot.columns), index=pivot.columns)))
+    ordered_data.append(('Total CPL', 'Total', pd.Series([type_totals['CPL']] * len(pivot.columns), index=pivot.columns)))
+    ordered_data.append(('Total Enterprise', 'Total', pd.Series([type_totals['Enterprise']] * len(pivot.columns), index=pivot.columns)))
+    ordered_data.append(('Total OD', 'Total', pd.Series([type_totals['OD']] * len(pivot.columns), index=pivot.columns)))
     
     # Add grand total
     grand_total = sum(type_totals.values())
-    ordered_data.append(('Grand Total', pd.Series([grand_total] * len(pivot.columns), index=pivot.columns)))
+    ordered_data.append(('Grand Total', 'Total', pd.Series([grand_total] * len(pivot.columns), index=pivot.columns)))
     
-    # Create new DataFrame from ordered data with single-level index
+    # Create new DataFrame from ordered data with multi-level index
     new_pivot = pd.DataFrame(
-        [row[1] for row in ordered_data],
-        index=[row[0] for row in ordered_data]
+        [row[2] for row in ordered_data],
+        index=pd.MultiIndex.from_tuples([(row[0], row[1]) for row in ordered_data], names=['Aggregator', 'Type'])
     )
     
     return new_pivot
 
 def create_od_traffic_pivot(dfs):
+    """Create OD traffic summary pivot table"""
+    combined_df = pd.concat([
+        dfs['od_traffic_ftd'].assign(Period='FTD'),
+        dfs['od_traffic_mtd'].assign(Period='MTD'),
+        dfs['od_traffic_lmtd'].assign(Period='LMTD')
+    ])
+    
+    # Create pivot table with periods as main columns
+    pivot = pd.pivot_table(
+        combined_df,
+        index=['Aggregator', 'ContentType'],
+        columns=['Period'],
+        values=['Sent', 'Delivered'],
+        aggfunc='sum'
+    )
+    
+    # Reorder the columns to have Period as main level
+    periods = ['FTD', 'MTD', 'LMTD']
+    metrics = ['Sent', 'Delivered']
+    
+    # Create new column order with Period as the main level
+    new_cols = []
+    for period in periods:
+        for metric in metrics:
+            new_cols.append((period, metric))
+    
+    # Create new column index
+    new_col_index = pd.MultiIndex.from_tuples(new_cols, names=['Period', 'Metric'])
+    
+    # Reorder the columns
+    reordered_pivot = pivot.reindex(columns=new_col_index)
+    
+    # Process aggregators in order
+    ordered_data = []
+    for agg in AGGREGATOR_ORDER:
+        if agg in reordered_pivot.index.get_level_values('Aggregator'):
+            # Add aggregator total first
+            agg_total = reordered_pivot.loc[agg].sum()
+            ordered_data.append((agg, 'Total', agg_total))
+            
+            # Add content type rows
+            for content_type in reordered_pivot.loc[agg].index:
+                ordered_data.append((agg, content_type, reordered_pivot.loc[(agg, content_type)]))
+    
+    # Create new DataFrame from ordered data
+    new_pivot = pd.DataFrame(
+        [row[2] for row in ordered_data],
+        index=pd.MultiIndex.from_tuples([(row[0], row[1]) for row in ordered_data])
+    )
+    
+    return new_pivot
+
+def load_mapping():
+    """Load the agent type mapping from CSV"""
+    mapping_df = pd.read_csv('mapping.csv')
+    return dict(zip(mapping_df['vcAgentID'], mapping_df['vcType']))
+
+def update_traffic_df_with_type(df, mapping):
+    """Update dataframe with agent types from mapping"""
+    # Create a new column for agent type
+    df['vcType'] = df['vcAgentID'].map(mapping)  # Changed from 'AgentID' to 'vcAgentID'
+    
+    # Fill any null values with 'Enterprise'
+    df['vcType'] = df['vcType'].fillna('Enterprise')
+    
+    return df
+
+def create_od_traffic_pivot(dfs):
+    """Create OD traffic summary pivot table"""
+    combined_df = pd.concat([
+        dfs['od_traffic_ftd'].assign(Period='FTD'),
+        dfs['od_traffic_mtd'].assign(Period='MTD'),
+        dfs['od_traffic_lmtd'].assign(Period='LMTD')
     ])
     
     # Create pivot table with proper hierarchy
@@ -209,21 +291,38 @@ def create_od_traffic_pivot(dfs):
 
 def create_od_summary_pivot(mtd_df):
     """Create OD Summary pivot table (3)"""
+    # Filter the dataframe to only include Karix and Valuefirst
+    aggregators = [
+        'Karix Mobile Private Limited',
+        'Valuefirst Digital Media Private Limited'
+    ]
+    filtered_df = mtd_df[mtd_df['Aggregator'].isin(aggregators)]
+    
     # Create pivot table with Aggregators as main columns and metrics as sub-columns
     pivot = pd.pivot_table(
-        mtd_df,
+        filtered_df,
         index=['Agent'],
         columns=['Aggregator'],
         values=['Sent', 'Delivered'],
-        aggfunc='sum'
-    ).reorder_levels([1, 0], axis=1)  # Reorder column levels
+        aggfunc='sum',
+        fill_value=0
+    )
     
-    # Add totals for each metric
-    total_sent = pivot.xs('Sent', axis=1, level=1).sum(axis=1)
-    total_delivered = pivot.xs('Delivered', axis=1, level=1).sum(axis=1)
+    # Reorder columns to show Sent/Delivered under each aggregator
+    new_cols = []
+    metrics = ['Sent', 'Delivered']
     
-    pivot['Total', 'Sent'] = total_sent
-    pivot['Total', 'Delivered'] = total_delivered
+    for agg in aggregators:
+        for metric in metrics:
+            new_cols.append((agg, metric))
+    
+    # Create new column index and reorder
+    new_col_index = pd.MultiIndex.from_tuples(new_cols, names=['Aggregator', 'Metric'])
+    pivot = pivot.reindex(columns=new_col_index)
+    
+    # Add total columns
+    for metric in metrics:
+        pivot[('Total', metric)] = pivot.xs(metric, axis=1, level=1).sum(axis=1)
     
     print("Created OD Summary pivot table")
     return pivot
@@ -231,29 +330,53 @@ def create_od_summary_pivot(mtd_df):
 def create_volume_pivot(mtd_df):
     """Create Volume Summary pivot table (4)"""
     df = mtd_df.copy()
+    
+    # Create RCS and SMS volumes
     df['SMS_Vol'] = df['Delivered'] * df['Parts']
     df['RCS_Vol'] = df['Delivered']
     
-    # Create pivot
-    pivot = pd.pivot_table(
+    # Create custom index mapping
+    def get_category(row):
+        if row['ContentType'] in ['Basic', 'Single']:
+            return f"{row['ContentType']}"
+        return None
+    
+    df['Category'] = df.apply(get_category, axis=1)
+    
+    # Create separate pivots for RCS and SMS
+    rcs_pivot = pd.pivot_table(
         df,
-        index=['ContentType'],
+        index=['Category'],
         columns=['Date'],
-        values=['RCS_Vol', 'SMS_Vol'],
+        values=['RCS_Vol'],
         aggfunc='sum'
-    )
+    ).fillna(0)
     
-    # Add total rows
-    total_rcs = pd.DataFrame(pivot['RCS_Vol'].sum()).T
-    total_sms = pd.DataFrame(pivot['SMS_Vol'].sum()).T
+    sms_pivot = pd.pivot_table(
+        df,
+        index=['Category'],
+        columns=['Date'],
+        values=['SMS_Vol'],
+        aggfunc='sum'
+    ).fillna(0)
     
-    total_rcs.index = pd.MultiIndex.from_tuples([('RCS_Vol_Total', '')])
-    total_sms.index = pd.MultiIndex.from_tuples([('SMS_Vol_Total', '')])
+    # Calculate totals
+    rcs_total = pd.DataFrame(rcs_pivot.sum(), columns=['RCS Total']).T
+    sms_total = pd.DataFrame(sms_pivot.sum(), columns=['SMS Total']).T
     
-    pivot = pd.concat([pivot, total_rcs, total_sms])
+    # Combine all parts with the desired order
+    final_pivot = pd.concat([
+        rcs_total,
+        rcs_pivot.loc[['Basic', 'Single']],
+        sms_total,
+        sms_pivot.loc[['Basic', 'Single']]
+    ])
+    
+    # Clean up the index
+    final_pivot.index = ['RCS Total', 'Basic', 'Single', 'SMS Total', 'Basic', 'Single']
     
     print("Created Volume Summary pivot table")
-    return pivot
+    return final_pivot
 
 def create_summary_type_pivot(mtd_df):
     """Create Summary by Type pivot table (5)"""
@@ -265,53 +388,69 @@ def create_summary_type_pivot(mtd_df):
         values=['iTotalSentSuccess', 'iTotalDelivered'],
         aggfunc='sum'
     )
-
-    # Calculate row totals (sum across columns for each metric)
-    sent_totals = pivot['iTotalSentSuccess'].sum(axis=1)
-    delivered_totals = pivot['iTotalDelivered'].sum(axis=1)
     
-    # Add totals columns
-    pivot[('iTotalSentSuccess', 'Total')] = sent_totals
-    pivot[('iTotalDelivered', 'Total')] = delivered_totals
+    # Define the desired column order
+    types = ['CPL', 'OD', 'Enterprise']
+    metrics = ['iTotalSentSuccess', 'iTotalDelivered']
     
-    # Calculate column totals (sum down each column)
-    total_row = pd.DataFrame({
-        ('iTotalSentSuccess', col): pivot['iTotalSentSuccess'][col].sum()
-        for col in pivot['iTotalSentSuccess'].columns
-    }, index=['Total'])
+    # Create new column order
+    new_cols = []
+    for type_ in types:
+        for metric in metrics:
+            new_cols.append((type_, metric))
     
-    total_row.update(pd.DataFrame({
-        ('iTotalDelivered', col): pivot['iTotalDelivered'][col].sum()
-        for col in pivot['iTotalDelivered'].columns
-    }, index=['Total']))
+    # Add total columns
+    total_sent = pivot['iTotalSentSuccess'].sum(axis=1)
+    total_delivered = pivot['iTotalDelivered'].sum(axis=1)
     
-    # Combine the pivot table with the totals row
-    pivot = pd.concat([pivot, total_row])
+    # Reorder columns and rename
+    pivot = pivot.reindex(columns=pd.MultiIndex.from_tuples(new_cols))
+    
+    # Add totals
+    pivot[('Total', 'iTotalSentSuccess')] = total_sent
+    pivot[('Total', 'iTotalDelivered')] = total_delivered
+    
+    # Rename columns for better readability
+    pivot = pivot.rename(columns={
+        'iTotalSentSuccess': 'Sent',
+        'iTotalDelivered': 'Delivered'
+    })
     
     print("Created Summary by Type pivot table")
     return pivot
 
 def create_daywise_od_summary(mtd_df):
     """Create Daywise OD Summary pivot table (6)"""
+    # Create pivot table with Date as the main column level
     pivot = pd.pivot_table(
         mtd_df,
         index=['Agent', 'ContentType'],
         columns=['Date'],
         values=['Sent', 'Delivered'],
         aggfunc='sum'
-    ).reorder_levels([1, 0], axis=1)  # Reorder column levels
+    )
     
-    # Calculate totals for each agent
-    agent_totals = {}
-    for agent in pivot.index.get_level_values(0).unique():
-        agent_data = pivot.loc[agent]
-        total_sent = agent_data.xs('Sent', axis=1, level=1).sum().sum()
-        total_delivered = agent_data.xs('Delivered', axis=1, level=1).sum().sum()
-        agent_totals[agent] = {'Sent': total_sent, 'Delivered': total_delivered}
+    # Reorder column levels to have Date as the main level
+    dates = pivot.columns.get_level_values(1).unique()
+    metrics = ['Sent', 'Delivered']
     
-    # Add totals columns
-    pivot['Total', 'Sent'] = pivot.xs('Sent', axis=1, level=1).sum(axis=1)
-    pivot['Total', 'Delivered'] = pivot.xs('Delivered', axis=1, level=1).sum(axis=1)
+    # Create new column order
+    new_cols = []
+    for date in dates:
+        for metric in metrics:
+            new_cols.append((date, metric))
+    
+    # Create new column index and reorder
+    new_col_index = pd.MultiIndex.from_tuples(new_cols, names=['Date', 'Metric'])
+    pivot = pivot.reindex(columns=new_col_index)
+    
+    # Add total columns
+    totals = {}
+    for metric in metrics:
+        totals[metric] = pivot.xs(metric, axis=1, level=1).sum(axis=1)
+    
+    for metric in metrics:
+        pivot[('Total', metric)] = totals[metric]
     
     print("Created Daywise OD Summary pivot table")
     return pivot
@@ -468,36 +607,43 @@ def create_clean_table(df):
         }}
         .clean-table tr.bold td {{
             font-weight: bold;
+            background-color: #f8f9fa;
         }}
-        .clean-table tr.gtotal td {{
+        .clean-table tr.total td {{
             font-weight: bold;
+            background-color: #e9ecef;
+        }}
+        .clean-table tr.grand-total td {{
+            font-weight: bold;
+            background-color: #dee2e6;
             color: #28a745;
         }}
     </style>
     """
     
-    # List of rows that should be bold
-    table1_bold = [
-        'ICS MOBILE PVT LTD',
+    # List of patterns for aggregator rows and total rows
+    aggregators = [
         'Karix Mobile Private Limited',
         'Valuefirst Digital Media Private Limited',
+        'ICS MOBILE PVT LTD',
+        'TANLA PLATFORMS LTD'
+    ]
+    
+    total_patterns = [
         'Total CPL',
         'Total Enterprise',
         'Total OD'
-    ]
-    
-    table2_bold = [
-        'Karix Mobile Private Limited',
-        'Valuefirst Digital Media Private Limited'
     ]
     
     # Add row classes for styling
     html_lines = html.split('\n')
     for i, line in enumerate(html_lines):
         if '<tr>' in line and '<td' in line:
-            if 'G. Total' in line:
-                html_lines[i] = line.replace('<tr>', '<tr class="gtotal">')
-            elif any(bold_text in line for bold_text in table1_bold + table2_bold):
+            if 'Grand Total' in line:
+                html_lines[i] = line.replace('<tr>', '<tr class="grand-total">')
+            elif any(total in line for total in total_patterns):
+                html_lines[i] = line.replace('<tr>', '<tr class="total">')
+            elif any(agg in line for agg in aggregators):
                 html_lines[i] = line.replace('<tr>', '<tr class="bold">')
     
     styled_html += '\n'.join(html_lines)
